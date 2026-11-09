@@ -26,7 +26,77 @@ python src/agent.py
 `generate_data.py` must print `generated: customers=1200 products=40 orders_raw=13084 tickets=164`. `generate_data.py` and `mock_llm.py` are used unmodified.
 
 ## Part A - Data Foundation
-<<PART A: to be filled in - cleaning rules, SQLite tables, query results>>
+### Setup
+Repository on branch `main`; virtual environment created with `python -m venv venv`; libraries installed with pip and written with `pip freeze` to `requirements.txt`; `.gitignore` lists `venv/`, `.env`, `__pycache__/`, `*.pyc` and `charts/`. The two supplied files were copied unmodified and `python generate_data.py` was run (see Reproduce).
+
+### Audit of the raw data
+Shapes: orders (13084, 9), customers (1200, 5), products (40, 4). Missing values: `orders.delivery_minutes` 2,541 (19.42%); `customers.age` 61 (5.08%); `customers.gender` 30 (2.50%); every other column has 0 missing. `order_amount` is read as text in the raw file because some entries are not numbers.
+
+| audit figure | value |
+|---|---|
+| raw orders rows | 13,084 |
+| exact duplicate rows | 119 |
+| rows with status pending | 656 |
+| distinct order_id | 12,309 |
+| order_amount entries that cannot be converted to a number | 120 |
+| negative delivery_minutes | 106 |
+| blank delivery_minutes | 2,541 |
+| blank age | 61 |
+| age outside 10-100 | 6 |
+| distinct raw city spellings | 24 |
+| distinct non-blank raw gender spellings | 10 |
+| blank gender | 30 |
+
+### Cleaning rules and what each one changed
+Customers:
+1. City: leading/trailing spaces removed and title case applied; 24 raw spellings became 6 cities.
+2. Gender: all 10 raw spellings mapped to `male` or `female`; the 30 blank values became `unknown`.
+3. Age: the 6 values outside 10-100 were set to missing; together with the 61 blank ages, 67 missing ages were filled with the median age of the customer's city (groupby + transform). Result: 0 missing ages, all between 18 and 60.
+4. `signup_date` converted to a datetime.
+
+Orders, in this order:
+1. `order_ts` converted to a datetime.
+2. Exact duplicate rows removed: 119 rows (13,084 to 12,965).
+3. For each `order_id`, only the record with the latest `order_ts` was kept. This removed the 656 earlier `pending` records (12,965 to 12,309 rows, one per order).
+4. `order_amount` converted to numeric; the 120 unparseable raw entries became missing and were filled from the product price: `round(price_inr x quantity x (1 - discount_pct / 100), 2)`. Result: 0 missing amounts.
+5. The 106 negative `delivery_minutes` were set to missing. For completed orders, every missing delivery time was filled with the median delivery time of that order's product category among completed orders (groupby + transform). For cancelled orders it was left missing, because a cancelled order was never delivered and a filled value would be invented data.
+
+After cleaning: 12,309 rows; 11,110 completed and 1,199 cancelled; no pending rows; 0 missing `order_amount`; 0 missing `delivery_minutes` among completed orders and 1,199 among cancelled orders; completed order_amount sums to INR 2,998,668.80. Cities: Pune 227, Delhi 210, Bengaluru 197, Chennai 191, Hyderabad 191, Mumbai 184. Genders: female 610, male 560, unknown 30.
+
+### Storage and validation
+The clean tables are written to `data/clean/` as CSV files and to `data/instamart.db` as tables `customers`, `products` and `orders` (`order_ts` stored as text `YYYY-MM-DD HH:MM:SS`). `src/validate.py` asserts 14 reference checkpoints and prints `ALL CHECKPOINTS PASSED`.
+
+### SQL analysis (`sql/queries.sql`, run with `pd.read_sql_query` in `src/part_a_report.py`)
+| query | technique | result |
+|---|---|---|
+| Q1 | WHERE then HAVING | 30 customers with completed orders over INR 500 whose total exceeds INR 8,000 |
+| Q2 | three-table join | 30 city/category rows; revenues add up to INR 2,998,668.80; largest cell Bengaluru / Electronics, INR 233,909.45 |
+| Q3 | scalar subquery | 11 products priced above the average catalogue price |
+| Q4 | LEFT JOIN | 25 customers with no completed order |
+| Q5 | CTE | 550 customers above the average total spend of INR 2,552.06 |
+| Q6 | RANK / DENSE_RANK / ROW_NUMBER | top per city: Bengaluru C0082 (12,856.20), Chennai C0930 (10,151.40), Delhi C0291 (13,742.60), Hyderabad C0743 (12,730.05), Mumbai C0693 (14,766.55), Pune C0426 (10,377.10); 8 rows have RANK different from ROW_NUMBER |
+| Q7 | running total | 183 daily rows; last cumulative revenue INR 2,998,668.80 |
+
+In Q6, customers with exactly the same total spend in a city share one RANK, but ROW_NUMBER still gives each of them a different number, so the two columns differ for tied customers and for the rows after them.
+
+### pandas cross-check
+`pd.pivot_table(..., margins=True)` of revenue by city and category has a grand total of INR 2,998,668.80, equal to the SQL total. Completed order_amount by city:
+
+| city | sum (INR) | mean (INR) | count |
+|---|---|---|---|
+| Bengaluru | 523,643.40 | 276.47 | 1,894 |
+| Chennai | 463,629.15 | 272.72 | 1,700 |
+| Delhi | 502,829.80 | 243.62 | 2,064 |
+| Hyderabad | 528,589.90 | 284.95 | 1,855 |
+| Mumbai | 479,058.50 | 297.00 | 1,613 |
+| Pune | 500,918.05 | 252.48 | 1,984 |
+
+### Exploratory analysis of completed order_amount
+Mean 269.91, median 135.00, skewness 4.61, Q1 64.80, Q3 297.00; the 1.5 x IQR fences are -283.50 and 645.30, with 0 outliers below and 897 above.
+- **What is the data about?** Six-month quick-commerce orders (April to September 2025) from 1,200 customers in six Indian cities, with amounts in INR.
+- **Distributions and statistics:** order values are strongly right-skewed: the mean (269.91) is about twice the median (135.00), because many small grocery baskets sit beside a few expensive electronics orders.
+- **Outliers and anomalies:** 897 orders exceed the upper fence of INR 645.30; they are mostly real high-value electronics purchases rather than errors. The raw data had planted problems (duplicates, pending records, text amounts, negative delivery times, impossible ages), all handled above.
+- **Relationships:** the largest correlation in absolute value is order_amount with discount_pct at about -0.095 (order_amount with quantity is +0.087). Correlations this small are very weak, and correlation of this size does not establish causation.
 
 ## Part B - Customer Segments and Lapse Prediction
 
