@@ -3,3 +3,6 @@ venv/
 __pycache__/
 *.pyc
 charts/
+# Runtime files
+state/
+outputs/*.jsonl
